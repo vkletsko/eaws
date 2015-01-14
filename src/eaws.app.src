@@ -1,0 +1,20 @@
+{application, eaws, [
+	{description,  "Erlang Amazon Web Services Library"},
+	{vsn,          "0.1.1"},
+	{registered,   [eaws_sup]},
+	{mod,          {eaws_app, []}},
+	{applications, [kernel, 
+                    stdlib,
+                    sasl,
+                    asn1,
+                    crypto,
+                    public_key,
+                    inets,
+                    ssl
+    ]},
+	{modules, [ ]},
+	{env, [  {timeout, 5000}
+        ]
+    }
+]}.
+
