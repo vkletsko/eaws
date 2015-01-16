@@ -1,3 +1,4 @@
+%% -*- coding: utf-8 -*-
 -module(eaws_util).
 -export([   calc_sign/2,
             formatted_params/1,
@@ -26,11 +27,13 @@ build_multipart_body(From, To, Subj, Date, Txt, Attchs) ->
   SmtpH = smtp_headers(From, To, Subj, Date, Bndry),
   SubtTxt = subtype_txt(Txt, Bndry),
   F = fun({FileName, Content}, Acc) ->
-            <<Acc/binary, (subtype_attach(to_binary(filename:basename(to_list(FileName))), Content, Bndry))/binary>>;
+            <<Acc/binary, (subtype_attach(to_binary(filename:basename(to_list(FileName))), Content, Bndry, <<"none">>))/binary>>;
+          ({FileName, Content, Encoded}, Acc) ->
+            <<Acc/binary, (subtype_attach(to_binary(filename:basename(to_list(FileName))), Content, Bndry, Encoded))/binary>>;
           (FileName, Acc) ->
             case file:read_file(to_list(FileName)) of
               {ok, Content} ->
-                <<Acc/binary, (subtype_attach(to_binary(filename:basename(to_list(FileName))), Content, Bndry))/binary>>;
+                <<Acc/binary, (subtype_attach(to_binary(filename:basename(to_list(FileName))), Content, Bndry, <<"none">>))/binary>>;
               _Error -> Acc
             end
   end,
@@ -52,16 +55,15 @@ unique(Size, Acc) ->
   Random = $a + random:uniform($z - $a),
   unique(Size, <<Acc/binary, Random>>).
 
-%% subtypes
 subtype_txt(Txt, Boundary) ->
+  %% Set Email Body Description
   <<"--", Boundary/binary, "\r\n",
-  "Content-Type: text/plain; charset=us-ascii\r\n",
+  "Content-Type: text/plain; charset=\"UTF-8\"\r\n",
   "Content-Transfer-Encoding: quoted-printable\r\n\r\n",
-  Txt/binary,
-  "\r\n\r\n"
-  >>.
+  (to_utf8(Txt))/binary,
+  "\r\n\r\n">>.
 
-subtype_attach(FileName, Content, Boundary) ->
+subtype_attach(FileName, Content, Boundary, Encoded) ->
   <<
   %% Set Content Description
   "--", Boundary/binary, "\r\n",
@@ -70,9 +72,12 @@ subtype_attach(FileName, Content, Boundary) ->
   "Content-Disposition: attachment; filename=\"", FileName/binary, "\"; size=", (to_binary(byte_size(Content)))/binary, "\r\n",
   "Content-Transfer-Encoding: base64\r\n\r\n",
   %% Set Content
-  (base64:encode(Content))/binary,
+  (b64encode(Encoded, Content))/binary,
   "\r\n"
   >>.
+
+b64encode(<<"base64">>, Content) -> Content;
+b64encode(_, Content) -> base64:encode(Content).
 
 gen_message_id() ->
   <<"<", (unique(8))/binary,
@@ -190,3 +195,20 @@ to_binary(X) when is_integer(X) -> integer_to_binary(X).
 
 to_list(X) when is_list(X) -> X;
 to_list(X) when is_binary(X) -> binary_to_list(X).
+
+%% Unicode lib
+%% author detect unicode S.Kostyshkin
+is_unicode_string(BinaryString) when is_binary(BinaryString) ->
+  Latin1List = binary_to_list(BinaryString),
+  UTF8List = unicode:characters_to_list(BinaryString),
+  Latin1List =/= UTF8List;
+is_unicode_string(String) when is_list(String) ->
+  is_unicode_string(list_to_binary(String)).
+
+to_utf8(Txt) ->
+  case is_unicode_string(Txt) of
+    true ->
+      unicode:characters_to_binary(unicode:characters_to_list(Txt));
+    false -> Txt
+  end.
+
