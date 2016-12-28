@@ -2,11 +2,8 @@
 -module(eaws_util).
 -export([   calc_sign/2,
             formatted_params/1,
-            auth_headers/2,
-            smtp_headers/5,
-            boundary/0,
-            build_multipart_body/6,
-            qs/1
+            build_multipart_body/2,
+            to_list/1
   ]).
 
 -define(PERCENT, 37).  % $\%
@@ -17,36 +14,78 @@
                      (C =:= ?FULLSTOP orelse C =:= $- orelse C =:= $~ orelse
                       C =:= $_))).
 
--include("eaws.hrl").
-
 %%%===================================================================
 %%% API
 %%%===================================================================
-build_multipart_body(From, To, Subj, Date, Txt, Attchs) ->
-  Bndry = boundary(),
-  SmtpH = smtp_headers(From, To, Subj, Date, Bndry),
-  SubtTxt = subtype_txt(Txt, Bndry),
-  F = fun({FileName, Content}, Acc) ->
-            <<Acc/binary, (subtype_attach(to_binary(filename:basename(to_list(FileName))), Content, Bndry, <<"none">>))/binary>>;
-          ({FileName, Content, Encoded}, Acc) ->
-            <<Acc/binary, (subtype_attach(to_binary(filename:basename(to_list(FileName))), Content, Bndry, Encoded))/binary>>;
-          (FileName, Acc) ->
-            case file:read_file(to_list(FileName)) of
-              {ok, Content} ->
-                <<Acc/binary, (subtype_attach(to_binary(filename:basename(to_list(FileName))), Content, Bndry, <<"none">>))/binary>>;
-              _Error -> Acc
-            end
-  end,
-  RawMData = <<SmtpH/binary, SubtTxt/binary, (lists:foldl(F, <<>>, Attchs))/binary, (end_boundary(Bndry))/binary>>,
-  qs([{<<"Action">>,          <<"SendRawEmail">>},
-      {<<"RawMessage.Data">>, base64:encode(RawMData)}
-  ]).
+-spec formatted_params(Par :: map()) ->
+  {ok, binary()}.
+formatted_params(#{ <<"from">>    := From,
+                    <<"html">>    := Html,
+                    <<"to">>      := To} = Par) ->
+  Txt = maps:get(<<"txt">>, Par, <<>>),
+  Subj = maps:get(<<"subject">>, Par, <<>>),
+  qs(#{ <<"Action">> => <<"SendEmail">>,
+        <<"Source">> => From,
+        <<"Message.Subject.Data">> => Subj,
+        <<"Message.Body.Text.Data">> => Txt,
+        <<"Message.Body.Html.Data">> => Html,
+        <<"Destination.ToAddresses.member.1">> => To
+  }).
 
-%% Boundary
+-spec build_multipart_body(Date :: binary(), Par :: map()) ->
+  {ok, binary()}.
+build_multipart_body(Date, #{ <<"from">>    := From,
+                              <<"to">>      := To,
+                              <<"attachments">> := Attchs} = Par) ->
+  Boundary = boundary(),
+  Txt = maps:get(<<"txt">>, Par, <<>>),
+  Subj = maps:get(<<"subject">>, Par, <<>>),
+  SmtpHeader = smtp_headers(From, To, Subj, Date, Boundary),
+  SubtTxt = subtype_txt(Txt, Boundary),
+  {_Boundary, AttachmentsPack} = lists:foldl(fun build_attach_package/2, {Boundary, <<>>}, Attchs),
+  RawMData = base64:encode(<<SmtpHeader/binary, SubtTxt/binary, AttachmentsPack/binary, (boundary(ending, Boundary))/binary>>),
+  qs(#{ <<"Action">> => <<"SendRawEmail">>,
+        <<"RawMessage.Data">> => RawMData
+  }).
+
+-spec calc_sign(binary(), binary()) ->
+  {Date :: binary(), Headers :: list()}.
+calc_sign(AccessId, SecretKey) ->
+  {Today, Time} = erlang:universaltime(),
+  {{Year, Month, Day}, {Hour, Minute, Second}} = {Today, Time},
+  Day_Name = httpd_util:day(calendar:day_of_the_week(Today)),
+  Month_Name = httpd_util:month(Month),
+  Date = list_to_binary(lists:flatten(io_lib:format("~s, ~p ~s ~p ~2.10.0B:~2.10.0B:~2.10.0B +0000",
+    [Day_Name, Day, Month_Name, Year, Hour, Minute, Second]))
+  ),
+  Signature = base64:encode(crypto:hmac(sha, SecretKey, Date)),
+  Auth = <<"AWS3-HTTPS AWSAccessKeyId=", AccessId/binary, ", Algorithm=HMACSHA1, Signature=", Signature/binary >>,
+  AuthHeaders = [
+    {<<"X-Amzn-Authorization">>, Auth},
+    {<<"Date">>, Date}
+  ],
+  {Date, AuthHeaders}.
+
+%% Utils
+build_attach_package({FileName, Content}, {Boundary, Acc}) when is_binary(Content) ->
+  FileName1 = to_binary_filename(filename:basename(FileName)),
+  {Boundary, <<Acc/binary, (subtype_attach(FileName1, Content, Boundary, <<"none">>))/binary>>};
+build_attach_package({FileName, Content, Encoded}, {Boundary, Acc}) when is_binary(Content) ->
+  FileName1 = to_binary_filename(filename:basename(FileName)),
+  {Boundary, <<Acc/binary, (subtype_attach(FileName1, Content, Boundary, Encoded))/binary>>};
+build_attach_package(FileName, {Boundary, Acc}) ->
+  FileName1 = to_binary_filename(filename:basename(FileName)),
+  case file:read_file(FileName) of
+    {ok, Content} ->
+      {Boundary, <<Acc/binary, (subtype_attach(FileName1, Content, Boundary, <<"none">>))/binary>>};
+    _Error ->
+      {Boundary, Acc}
+  end.
+
 boundary() ->
   << <<"_WebKitBoundary_">>/binary, (unique(32))/binary>>.
 
-end_boundary(Boundary) ->
+boundary(ending, Boundary) ->
   <<"\r\n--", Boundary/binary, "--\r\n">>.
 
 unique(Size) -> unique(Size, <<>>).
@@ -69,7 +108,7 @@ subtype_attach(FileName, Content, Boundary, Encoded) ->
   "--", Boundary/binary, "\r\n",
   "Content-Type: ", (mime_type(FileName))/binary, "; name=\"", FileName/binary, "\"\r\n",
   "Content-Description: ", FileName/binary, "\r\n",
-  "Content-Disposition: attachment; filename=\"", FileName/binary, "\"; size=", (to_binary(byte_size(Content)))/binary, "\r\n",
+  "Content-Disposition: attachment; filename=\"", FileName/binary, "\"; size=", (integer_to_binary(byte_size(Content)))/binary, "\r\n",
   "Content-Transfer-Encoding: base64\r\n\r\n",
   %% Set Content
   (b64encode(Encoded, Content))/binary,
@@ -87,51 +126,13 @@ gen_message_id() ->
     "-", (unique(12))/binary,
     "@amazon.com>">>.
 
-calc_sign(AccessId, SecretKey) ->
-    {Today, Time} = erlang:universaltime(),
-    {{Year, Month, Day}, {Hour, Minute, Second}} = {Today, Time},
-    Day_Name = httpd_util:day(calendar:day_of_the_week(Today)),
-    Month_Name = httpd_util:month(Month),
-    Date = list_to_binary(lists:flatten(io_lib:format("~s, ~p ~s ~p ~2.10.0B:~2.10.0B:~2.10.0B +0000",
-        [Day_Name, Day, Month_Name, Year, Hour, Minute, Second]))
-    ),
-    Signature = base64:encode(crypto:hmac(sha, SecretKey, Date)),
-    Auth = <<"AWS3-HTTPS AWSAccessKeyId=", AccessId/binary, ", Algorithm=HMACSHA1, Signature=", Signature/binary >>,
-    {Date, Auth}.
-
-%% create post params string
 qs(Params) ->
-    qs(Params, <<>>).
+  {ok, maps:fold(fun bin_kv/3, <<>>,Params)}.
 
-qs([], Acc) -> Acc;
-qs([{K, V}|[]], Acc) ->
-    V1 = urlencode(V), 
-    <<Acc/binary, "&", K/binary, "=", V1/binary>>;
-qs([{K,V}|T], <<>>) ->
-    V1 = urlencode(V),
-    qs(T, <<K/binary, "=", V1/binary>>);
-qs([{K, V}|T], Acc) ->
-    V1 = urlencode(V), 
-    qs(T, <<Acc/binary, "&", K/binary, "=", V1/binary >>).
-
-formatted_params(Par) ->
-  From = proplists:get_value(<<"from">>, Par, <<>>),
-  Subj = proplists:get_value(<<"subject">>, Par, <<>>),
-  Txt = proplists:get_value(<<"txt">>, Par, <<>>),
-  Html = proplists:get_value(<<"html">>, Par, <<>>),
-  To = proplists:get_value(<<"to">>, Par, <<>>),
-  [ {<<"Action">>,                          <<"SendEmail">>},
-    {<<"Source">>,                          From},
-    {<<"Message.Subject.Data">>,            Subj},
-    {<<"Message.Body.Text.Data">>,          Txt},
-    {<<"Message.Body.Html.Data">>,          Html},
-    {<<"Destination.ToAddresses.member.1">>,To}
-  ].
-
-auth_headers(Auth, Date) ->
-  [ {<<"X-Amzn-Authorization">>, Auth},
-    {<<"Date">>, Date}
-  ].
+bin_kv(K, V, <<>>) ->
+  <<K/binary, "=", (urlencode(V))/binary>>;
+bin_kv(K, V, AccIn) ->
+  <<AccIn/binary, "&", K/binary, "=", (urlencode(V))/binary >>.
 
 smtp_headers(From, To, Subject, Date, PartSep) ->
   <<
@@ -148,35 +149,35 @@ smtp_headers(From, To, Subject, Date, PartSep) ->
 
 %% urlencode 
 urlencode(Bin) ->
-        urlencode(Bin, []).
+  urlencode(Bin, []).
 
 urlencode(Bin, Opts) ->
-        Plus = not lists:member(noplus, Opts),
-        Upper = lists:member(upper, Opts),
-        urlencode(Bin, <<>>, Plus, Upper).
+  Plus = not lists:member(noplus, Opts),
+  Upper = lists:member(upper, Opts),
+  urlencode(Bin, <<>>, Plus, Upper).
 
-urlencode(<<C, Rest/binary>>, Acc, P=Plus, U=Upper) ->
-        if      C >= $0, C =< $9 -> urlencode(Rest, <<Acc/binary, C>>, P, U);
-                C >= $A, C =< $Z -> urlencode(Rest, <<Acc/binary, C>>, P, U);
-                C >= $a, C =< $z -> urlencode(Rest, <<Acc/binary, C>>, P, U);
-                C =:= $.; C =:= $-; C =:= $~; C =:= $_ ->
-                urlencode(Rest, <<Acc/binary, C>>, P, U);
-                C =:= $ , Plus ->
-                urlencode(Rest, <<Acc/binary, $+>>, P, U);
-                true ->
-                H = C band 16#F0 bsr 4, L = C band 16#0F,
-                H1 = if Upper -> tohexu(H); true -> tohexl(H) end,
-                L1 = if Upper -> tohexu(L); true -> tohexl(L) end,
-                urlencode(Rest, <<Acc/binary, $%, H1, L1>>, P, U)
-        end;
+urlencode(<<C, Rest/binary>>, Acc, Plus, Upper) ->
+  if  C >= $0, C =< $9 -> urlencode(Rest, <<Acc/binary, C>>, Plus, Upper);
+      C >= $A, C =< $Z -> urlencode(Rest, <<Acc/binary, C>>, Plus, Upper);
+      C >= $a, C =< $z -> urlencode(Rest, <<Acc/binary, C>>, Plus, Upper);
+      C =:= $.; C =:= $-; C =:= $~; C =:= $_ ->
+        urlencode(Rest, <<Acc/binary, C>>, Plus, Upper);
+      C =:= $ , Plus ->
+        urlencode(Rest, <<Acc/binary, $+>>, Plus, Upper);
+      true ->
+        H = C band 16#F0 bsr 4, L = C band 16#0F,
+        H1 = tohexu(H),
+        L1 = tohexu(L),
+        urlencode(Rest, <<Acc/binary, $%, H1, L1>>, Plus, Upper)
+  end;
 urlencode(<<>>, Acc, _Plus, _Upper) ->
-        Acc.
+  Acc.
 
 tohexu(C) when C < 10 -> $0 + C;
 tohexu(C) when C < 17 -> $A + C - 10.
 
-tohexl(C) when C < 10 -> $0 + C;
-tohexl(C) when C < 17 -> $a + C - 10.
+%%tohexl(C) when C < 10 -> $0 + C;
+%%tohexl(C) when C < 17 -> $a + C - 10.
 
 %% @Todo More
 mime_type(FileName) ->
@@ -189,15 +190,14 @@ mime_type(FileName) ->
     _ -> <<"text/plain">>
   end.
 
-to_binary(X) when is_binary(X) -> X;
-to_binary(X) when is_list(X) -> list_to_binary(X);
-to_binary(X) when is_integer(X) -> integer_to_binary(X).
-
+-spec to_list(list() | binary()) -> list().
 to_list(X) when is_list(X) -> X;
 to_list(X) when is_binary(X) -> binary_to_list(X).
 
-%% Unicode lib
-%% author detect unicode S.Kostyshkin
+to_binary_filename(FName) when is_binary(FName) -> FName;
+to_binary_filename(FName) when is_list(FName) -> list_to_binary(FName).
+
+%% unicode detection
 is_unicode_string(BinaryString) when is_binary(BinaryString) ->
   Latin1List = binary_to_list(BinaryString),
   UTF8List = unicode:characters_to_list(BinaryString),

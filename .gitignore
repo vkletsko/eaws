@@ -7,6 +7,8 @@ ebin/
 .idea
 test/*.beam
 *.iml
+*.plt
 *.dump
 .rebar/
+.erlang.mk
 *~

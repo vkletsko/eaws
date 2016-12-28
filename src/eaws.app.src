@@ -1,6 +1,6 @@
 {application, eaws, [
-	{description,  "Erlang Amazon Web Services Library"},
-	{vsn,          "0.1.1"},
+	{description,  "Erlang Library to send mail using Amazon Web Services"},
+	{vsn,          "v0.3.0"},
 	{registered,   [eaws_sup]},
 	{mod,          {eaws_app, []}},
 	{applications, [kernel, 
@@ -12,9 +12,8 @@
                     inets,
                     ssl
     ]},
-	{modules, [ ]},
-	{env, [  {timeout, 5000}
-        ]
+	{modules, [eaws_app]},
+	{env, []
     }
 ]}.
 
